@@ -1,42 +1,22 @@
 import requests
 import time
 from datetime import datetime, timedelta, timezone
-from config import SUBREDDITS, WEBDEV_KEYWORDS, TARGET_COUNTRIES, AFRICAN_COUNTRIES
+from config import WEBDEV_KEYWORDS, AFRICAN_COUNTRIES
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; WebDevLeadBot/1.0; +https://acedigitalsempire.com)"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
-
 
 def is_webdev_related(text):
     text_lower = text.lower()
     return any(kw in text_lower for kw in WEBDEV_KEYWORDS)
 
-
-def is_target_country(text):
+def is_african(text):
     text_lower = text.lower()
-    # Exclude African countries first
-    if any(country in text_lower for country in AFRICAN_COUNTRIES):
-        return False
-    # Check if target country mentioned OR no location specified (assume global)
-    has_target = any(country in text_lower for country in TARGET_COUNTRIES)
-    return has_target
-
-
-def is_hiring_post(title):
-    title_lower = title.lower()
-    hiring_signals = [
-        "hiring", "looking for", "need a", "need someone", "seeking",
-        "wanted", "want to hire", "want someone", "budget", "paid",
-        "paying", "project", "freelancer wanted", "help with",
-        "building", "create", "develop", "design"
-    ]
-    return any(signal in title_lower for signal in hiring_signals)
-
+    return any(c in text_lower for c in AFRICAN_COUNTRIES)
 
 def extract_budget(text):
     import re
-    # Find budget mentions like $500, $1000, $2,000
     patterns = [
         r'\$[\d,]+(?:k)?(?:\s*-\s*\$[\d,]+(?:k)?)?',
         r'[\d,]+\s*(?:USD|usd|dollars)',
@@ -48,153 +28,335 @@ def extract_budget(text):
             return match.group(0).strip()
     return "Not specified"
 
-
-def fetch_reddit_leads():
+# ─────────────────────────────────────────────
+# SOURCE 1: Hacker News "Who wants to be hired"
+# and "Freelancer? Seeking Freelancer?" threads
+# Free API, no auth needed, very low competition
+# ─────────────────────────────────────────────
+def fetch_hackernews():
     leads = []
-    now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(hours=48)
+    try:
+        # Search HN for web dev related posts
+        search_terms = [
+            "web developer", "website developer", "wordpress",
+            "landing page", "web design", "frontend developer"
+        ]
 
-    for subreddit in SUBREDDITS:
-        url = f"https://www.reddit.com/r/{subreddit}/new.json?limit=50"
+        for term in search_terms:
+            url = f"https://hn.algolia.com/api/v1/search_by_date?query={term}&tags=comment&numericFilters=created_at_i>{int((datetime.now(timezone.utc) - timedelta(days=2)).timestamp())}"
+            try:
+                res = requests.get(url, headers=HEADERS, timeout=15)
+                if res.status_code != 200:
+                    continue
+                data = res.json()
+                hits = data.get("hits", [])
+
+                for hit in hits:
+                    text = hit.get("comment_text", "") or ""
+                    story_title = hit.get("story_title", "") or ""
+                    full_text = f"{story_title} {text}"
+
+                    if not is_webdev_related(full_text):
+                        continue
+                    if is_african(full_text):
+                        continue
+
+                    # Focus on hiring/seeking posts
+                    if not any(word in full_text.lower() for word in [
+                        "looking for", "hiring", "need", "seeking", "want",
+                        "budget", "project", "build", "create", "design"
+                    ]):
+                        continue
+
+                    budget = extract_budget(full_text)
+                    object_id = hit.get("objectID", "")
+                    story_id = hit.get("story_id", "")
+                    link = f"https://news.ycombinator.com/item?id={story_id}" if story_id else "https://news.ycombinator.com"
+                    author = hit.get("author", "Unknown")
+                    created = hit.get("created_at", "")
+
+                    display_text = text[:300].strip()
+                    if len(text) > 300:
+                        display_text += "..."
+
+                    leads.append({
+                        "title": story_title or f"HN: {text[:80]}...",
+                        "source": "Hacker News",
+                        "platform": "HackerNews",
+                        "author": author,
+                        "budget": budget,
+                        "posted": created[:10] if created else "Recent",
+                        "link": link,
+                        "preview": display_text,
+                        "contact": f"https://news.ycombinator.com/user?id={author}"
+                    })
+
+                time.sleep(1)
+
+            except Exception as e:
+                print(f"[HN] Error for term '{term}': {e}")
+                continue
+
+        print(f"[HackerNews] {len(leads)} leads found")
+
+    except Exception as e:
+        print(f"[HackerNews] Error: {e}")
+
+    return leads
+
+
+# ─────────────────────────────────────────────
+# SOURCE 2: Craigslist — USA/Canada cities
+# Locals posting "need website" with real budgets
+# Very low competition — most devs ignore Craigslist
+# ─────────────────────────────────────────────
+def fetch_craigslist():
+    leads = []
+
+    # Major USA + Canada cities
+    cities = [
+        "newyork", "losangeles", "chicago", "houston", "phoenix",
+        "philadelphia", "sanantonio", "dallas", "austin", "seattle",
+        "boston", "miami", "denver", "atlanta", "toronto",
+        "vancouver", "calgary", "montreal", "sfbay", "portland"
+    ]
+
+    for city in cities:
+        url = f"https://{city}.craigslist.org/search/web?format=json"
         try:
-            res = requests.get(url, headers=HEADERS, timeout=20)
+            res = requests.get(url, headers=HEADERS, timeout=15)
             if res.status_code != 200:
-                print(f"[Reddit] r/{subreddit} returned {res.status_code}")
-                time.sleep(2)
+                # Try alternate URL format
+                url2 = f"https://{city}.craigslist.org/search/cpg?query=web+developer&format=json"
+                res = requests.get(url2, headers=HEADERS, timeout=15)
+                if res.status_code != 200:
+                    continue
+
+            data = res.json()
+            items = data.get("data", {}).get("items", []) if isinstance(data, dict) else []
+
+            if not items:
+                # Try parsing as list
+                if isinstance(data, list):
+                    items = data
+
+            for item in items:
+                if isinstance(item, list) and len(item) > 2:
+                    title = str(item[2]) if len(item) > 2 else ""
+                    post_id = str(item[0]) if item else ""
+                    link = f"https://{city}.craigslist.org/cpg/{post_id}.html"
+                elif isinstance(item, dict):
+                    title = item.get("title", "")
+                    link = item.get("url", f"https://{city}.craigslist.org")
+                else:
+                    continue
+
+                if not title:
+                    continue
+                if not is_webdev_related(title):
+                    continue
+                if is_african(title):
+                    continue
+
+                budget = extract_budget(title)
+                leads.append({
+                    "title": title,
+                    "source": f"Craigslist ({city})",
+                    "platform": "Craigslist",
+                    "author": "Local Business Owner",
+                    "budget": budget,
+                    "posted": "Recent",
+                    "link": link,
+                    "preview": f"Local business in {city.title()} looking for web development help.",
+                    "contact": link
+                })
+
+            time.sleep(2)
+
+        except Exception as e:
+            print(f"[Craigslist] {city} error: {e}")
+            time.sleep(1)
+            continue
+
+    print(f"[Craigslist] {len(leads)} leads found")
+    return leads
+
+
+# ─────────────────────────────────────────────
+# SOURCE 3: GitHub Discussions & Issues
+# Startups posting "looking for developer" publicly
+# Very low competition — only developers see these
+# ─────────────────────────────────────────────
+def fetch_github():
+    leads = []
+
+    search_queries = [
+        "need web developer",
+        "looking for web developer",
+        "hire wordpress developer",
+        "need website built",
+        "looking for frontend developer",
+        "need landing page built",
+    ]
+
+    for query in search_queries:
+        url = f"https://api.github.com/search/issues?q={requests.utils.quote(query)}&sort=created&order=desc&per_page=10"
+        try:
+            res = requests.get(url, headers={
+                **HEADERS,
+                "Accept": "application/vnd.github.v3+json"
+            }, timeout=15)
+
+            if res.status_code == 403:
+                print(f"[GitHub] Rate limited — waiting 30s")
+                time.sleep(30)
+                continue
+            if res.status_code != 200:
                 continue
 
             data = res.json()
-            posts = data.get("data", {}).get("children", [])
+            items = data.get("items", [])
 
-            for post in posts:
-                p = post.get("data", {})
-                title = p.get("title", "")
-                body = p.get("selftext", "")
+            now = datetime.now(timezone.utc)
+            cutoff = now - timedelta(days=7)
+
+            for item in items:
+                title = item.get("title", "")
+                body = item.get("body", "") or ""
                 full_text = f"{title} {body}"
-                created = datetime.fromtimestamp(p.get("created_utc", 0), tz=timezone.utc)
+                created_at = item.get("created_at", "")
 
-                # Only last 48 hours
-                if created < cutoff:
-                    continue
+                if created_at:
+                    try:
+                        created = datetime.strptime(created_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                        if created < cutoff:
+                            continue
+                    except Exception:
+                        pass
 
-                # Must be web dev related
                 if not is_webdev_related(full_text):
                     continue
-
-                # Must be hiring/looking
-                if not is_hiring_post(title):
+                if is_african(full_text):
                     continue
 
-                # Must be target country OR no location specified
-                # For r/forhire and r/hiring, location is usually in title
-                # For others, we include if no African country mentioned
-                if subreddit in ["forhire", "hiring"]:
-                    if not is_target_country(full_text):
-                        continue
-                else:
-                    # For startup/business subs, exclude only African countries
-                    if any(c in full_text.lower() for c in AFRICAN_COUNTRIES):
-                        continue
+                # Only include if it looks like a hiring/request post
+                if not any(word in full_text.lower() for word in [
+                    "looking for", "hiring", "need", "budget", "paid",
+                    "freelance", "contract", "project"
+                ]):
+                    continue
 
                 budget = extract_budget(full_text)
-                post_url = f"https://reddit.com{p.get('permalink', '')}"
-                author = p.get("author", "Unknown")
-                posted_time = created.strftime("%b %d, %Y %I:%M %p UTC")
-
-                # Trim body for display
+                author = item.get("user", {}).get("login", "Unknown")
+                link = item.get("html_url", "https://github.com")
                 display_body = body[:300].strip()
                 if len(body) > 300:
                     display_body += "..."
 
                 leads.append({
                     "title": title,
-                    "source": f"r/{subreddit}",
-                    "platform": "Reddit",
-                    "author": f"u/{author}",
+                    "source": "GitHub Issues",
+                    "platform": "GitHub",
+                    "author": f"@{author}",
                     "budget": budget,
-                    "posted": posted_time,
-                    "link": post_url,
+                    "posted": created_at[:10] if created_at else "Recent",
+                    "link": link,
                     "preview": display_body or title,
-                    "contact": f"https://reddit.com/u/{author}"
+                    "contact": f"https://github.com/{author}"
                 })
 
-            print(f"[Reddit] r/{subreddit}: scraped successfully")
-            time.sleep(2)  # Rate limit between subreddits
-
-        except Exception as e:
-            print(f"[Reddit] r/{subreddit} error: {e}")
             time.sleep(3)
 
+        except Exception as e:
+            print(f"[GitHub] Error for '{query}': {e}")
+            time.sleep(2)
+            continue
+
+    print(f"[GitHub] {len(leads)} leads found")
     return leads
 
 
-def fetch_indiehackers_leads():
-    """Scrape Indie Hackers for web dev requests"""
+# ─────────────────────────────────────────────
+# SOURCE 4: Hacker News "Who is hiring" monthly thread
+# Top quality — YC founders and serious startups only
+# ─────────────────────────────────────────────
+def fetch_hn_hiring_thread():
     leads = []
-    url = "https://www.indiehackers.com/posts.json?order=latest&limit=50"
-
     try:
-        res = requests.get(url, headers=HEADERS, timeout=20)
+        # Search for the latest "Who is hiring" thread
+        url = "https://hn.algolia.com/api/v1/search?query=Ask+HN+Who+is+hiring&tags=story&numericFilters=points>100"
+        res = requests.get(url, headers=HEADERS, timeout=15)
         if res.status_code != 200:
-            print(f"[IndieHackers] Status: {res.status_code}")
             return leads
 
-        posts = res.json()
-        now = datetime.now(timezone.utc)
-        cutoff = now - timedelta(hours=48)
+        data = res.json()
+        hits = data.get("hits", [])
 
-        for post in posts:
-            title = post.get("title", "")
-            body = post.get("body", "")
-            full_text = f"{title} {body}"
+        if not hits:
+            return leads
 
-            # Check recency
-            created_at = post.get("createdAt", 0)
-            if created_at:
-                created = datetime.fromtimestamp(created_at / 1000, tz=timezone.utc)
-                if created < cutoff:
-                    continue
+        # Get the most recent hiring thread
+        latest = hits[0]
+        thread_id = latest.get("objectID")
+        if not thread_id:
+            return leads
 
-            if not is_webdev_related(full_text):
+        # Fetch comments from the thread
+        comments_url = f"https://hn.algolia.com/api/v1/items/{thread_id}"
+        res2 = requests.get(comments_url, headers=HEADERS, timeout=15)
+        if res2.status_code != 200:
+            return leads
+
+        thread_data = res2.json()
+        children = thread_data.get("children", [])
+
+        for comment in children[:100]:  # Check first 100 comments
+            text = comment.get("text", "") or ""
+            if not text:
+                continue
+            if not is_webdev_related(text):
+                continue
+            if is_african(text):
                 continue
 
-            if any(c in full_text.lower() for c in AFRICAN_COUNTRIES):
-                continue
-
-            budget = extract_budget(full_text)
-            author = post.get("username", "Unknown")
-            slug = post.get("slug", "")
-            post_url = f"https://www.indiehackers.com/post/{slug}" if slug else "https://www.indiehackers.com"
-
-            display_body = body[:300].strip()
-            if len(body) > 300:
-                display_body += "..."
+            author = comment.get("author", "Unknown")
+            comment_id = comment.get("id", "")
+            budget = extract_budget(text)
+            display_text = text[:300].strip()
+            if len(text) > 300:
+                display_text += "..."
 
             leads.append({
-                "title": title,
-                "source": "Indie Hackers",
-                "platform": "IndieHackers",
+                "title": f"HN Hiring: {text[:70]}...",
+                "source": "HN Who's Hiring",
+                "platform": "HackerNews",
                 "author": author,
                 "budget": budget,
-                "posted": "Recent",
-                "link": post_url,
-                "preview": display_body or title,
-                "contact": f"https://www.indiehackers.com/{author}"
+                "posted": "This month",
+                "link": f"https://news.ycombinator.com/item?id={comment_id}",
+                "preview": display_text,
+                "contact": f"https://news.ycombinator.com/user?id={author}"
             })
 
-        print(f"[IndieHackers] {len(leads)} leads found")
+        print(f"[HN Hiring Thread] {len(leads)} leads found")
 
     except Exception as e:
-        print(f"[IndieHackers] Error: {e}")
+        print(f"[HN Hiring Thread] Error: {e}")
 
     return leads
 
 
+# ─────────────────────────────────────────────
+# MAIN — combine all sources
+# ─────────────────────────────────────────────
 def fetch_all_leads():
     print("[INFO] Starting WebDev Lead Scraper...")
     all_leads = []
-    all_leads += fetch_reddit_leads()
-    all_leads += fetch_indiehackers_leads()
+
+    all_leads += fetch_hackernews()
+    all_leads += fetch_craigslist()
+    all_leads += fetch_github()
+    all_leads += fetch_hn_hiring_thread()
 
     # Deduplicate by title
     seen = set()
